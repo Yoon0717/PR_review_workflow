@@ -1,0 +1,681 @@
+name: PR Quality and Security Check
+
+on:
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  quality-security-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Diff Maps
+        run: |
+          mkdir -p .diff_maps
+          CHANGED_FILES=$(git diff --name-only origin/develop...HEAD | grep -v '^[[:space:]]*$')
+          echo "Creating detailed diff maps for changed files..."
+          while IFS= read -r FILE; do
+            if [[ "$FILE" == *.json ]] || [[ "$FILE" == *.png ]] || [ ! -f "$FILE" ]; then
+              continue
+            fi
+            echo "Processing diff map for $FILE"
+            DIFF_PATH=".diff_maps/$(dirname "${FILE//\//_}")"
+            mkdir -p "$DIFF_PATH" 2>/dev/null
+            git diff -U5 origin/develop...HEAD -- "$FILE" > ".diff_maps/${FILE//\//_}.diff" 2>/dev/null || {
+              echo "Warning: Could not create diff for $FILE"
+              continue
+            }
+            git diff --unified=0 origin/develop...HEAD -- "$FILE" | 
+            grep -n "^+" | grep -v "^+++ " | 
+            sed 's/^+//' > ".diff_maps/${FILE//\//_}.added_lines" 2>/dev/null || {
+              echo "Warning: Could not extract added lines for $FILE"
+              touch ".diff_maps/${FILE//\//_}.added_lines"
+            }
+            git diff --no-prefix -U0 origin/develop...HEAD -- "$FILE" | 
+            awk '
+            BEGIN { in_hunk = 0; current_line = 0; }
+            /^@@/ {
+              match($0, /\+([0-9]+)/, start);
+              in_hunk = 1;
+              current_line = start[1];
+              next;
+            }
+            in_hunk && /^[^-]/ {
+              if (substr($0, 1, 1) != "-") {
+                print current_line ":" $0;
+                current_line++;
+              }
+            }
+            ' > ".diff_maps/${FILE//\//_}.line_map" 2>/dev/null || {
+              echo "Warning: Could not create line map for $FILE"
+              touch ".diff_maps/${FILE//\//_}.line_map"
+            }
+            git diff -U5 origin/develop...HEAD -- "$FILE" | 
+            grep -n "^@@" | 
+            sed 's/^/hunk:/' > ".diff_maps/${FILE//\//_}.hunks" 2>/dev/null || {
+              echo "Warning: Could not extract hunk headers for $FILE"
+              touch ".diff_maps/${FILE//\//_}.hunks"
+            }
+            if [ -f "$FILE" ]; then
+              cp "$FILE" ".diff_maps/${FILE//\//_}.content" 2>/dev/null || {
+                echo "Warning: Could not copy content for $FILE"
+              }
+            fi
+            git diff -U10 origin/develop...HEAD -- "$FILE" > ".diff_maps/${FILE//\//_}.extended_diff" 2>/dev/null || {
+              echo "Warning: Could not create extended diff for $FILE"
+              touch ".diff_maps/${FILE//\//_}.extended_diff"
+            }
+          done <<< "$CHANGED_FILES"
+          echo "✅ Created detailed diff mappings for all changed files"
+
+      - name: Gather Full Code From Changed Files
+        run: |
+          CHANGED_FILES=$(git diff --name-only origin/develop...HEAD)
+          echo '{"original_files": [' > original_files_temp.json
+          for file in $CHANGED_FILES; do
+            if [[ $file == *.json ]] || [[ $file == *.png ]]; then
+              continue
+            fi
+            if [ -f "$file" ]; then
+              CONTENT=$(jq -Rs . < "$file")
+              echo "{\"filename\": \"$file\", \"content\": $CONTENT}," >> original_files_temp.json
+            fi
+          done
+          sed -i '$ s/,$//' original_files_temp.json
+          echo "]}" >> original_files_temp.json
+
+      - name: Analyze with OpenAI
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PR_SECURITY_REVIEW_PROMPT: ${{ vars.PR_SECURITY_REVIEW_PROMPT }}
+        run: |
+          set -e
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          COMMIT_ID=$(git rev-parse HEAD)
+          echo "📌 Debug: Processing changed files..."
+          CHANGED_FILES=$(git diff --name-only origin/develop...HEAD | grep -v '^[[:space:]]*$')
+          echo "[]" > ai_review_output.json
+          echo "📌 Debug: Fetching PR diff positions from GitHub API..."
+          gh api repos/${{ github.repository }}/pulls/${PR_NUMBER}/files > pr_diff_positions.json
+          while IFS= read -r FILE; do
+            if [[ "$FILE" == *.json ]] || [[ "$FILE" == *.png ]]; then
+              continue
+            fi
+            if [ ! -f "$FILE" ]; then
+              echo "📌 Debug: Skipping $FILE (file no longer exists)"
+              continue
+            fi
+            echo "📌 Debug: Processing $FILE..."
+            IS_DELETED=false
+            RAW_DIFF=$(git diff --unified=5 origin/develop...HEAD -- "$FILE")
+            if [[ $RAW_DIFF == *"deleted file mode"* ]]; then
+              IS_DELETED=true
+              echo "📌 Debug: Detected deleted file: $FILE"
+            fi
+            FILE_EXT="${FILE##*.}"
+            LANGUAGE_CONTEXT=""
+            case "$FILE_EXT" in
+              c|cpp|h)
+                LANGUAGE_CONTEXT="This is a C/C++ file. Look for memory management issues, buffer overflows, and null pointer dereferences."
+                ;;
+              js|ts)
+                LANGUAGE_CONTEXT="This is a JavaScript/TypeScript file. Look for type errors, undefined variables, and security issues like XSS or injection."
+                ;;
+              py)
+                LANGUAGE_CONTEXT="This is a Python file. Look for exception handling, type errors, and potential security issues."
+                ;;
+              *)
+                LANGUAGE_CONTEXT="Analyze this file for best practices, bugs, and security issues."
+                ;;
+            esac
+            FULL_FILE_CONTENT=""
+            if [ -f "$FILE" ] && [ "$IS_DELETED" = false ]; then
+              FULL_FILE_CONTENT=$(cat "$FILE" | head -n 100)
+            fi
+            ENHANCED_PROMPT="${PR_SECURITY_REVIEW_PROMPT}
+            **Code Review Request**
+            - **Filename:** ${FILE}
+            - **Language Info:** ${LANGUAGE_CONTEXT}
+            - **Git Diff:** (Only analyze lines starting with +)
+            \`\`\`diff
+            ${RAW_DIFF}
+            \`\`\`
+            **File Context (first 100 lines):**
+            \`\`\`
+            ${FULL_FILE_CONTENT}
+            \`\`\`
+            **Important Processing Instructions:**
+            1. When you count line numbers, start from the beginning of the filtered diff I've provided.
+            2. Each unchanged/context line and each added line (+) counts as one line number.
+            3. Count VERY CAREFULLY - accurate line numbers are critical for inline comment placement.
+            4. For each line, verify your line number is correct by comparing the code at that line with your code_snippet.
+            5. ONLY include added lines (starting with +) in your analysis - these are the only lines that can be modified.
+            **Output Requirements:**
+            1. Your response MUST be a valid JSON array containing multiple objects (one per issue found).
+            2. Each object must have EXACTLY these fields:
+               - filename: \"${FILE}\"
+               - start_line: The EXACT line number where the issue begins
+               - end_line: The line number where the issue ends (same as start_line for single-line issues)
+               - code_snippet: An EXACT substring (10-50 chars) from the problematic line for matching
+               - comment: A clear, concise explanation of the issue
+               - suggested_code: ONLY the fixed code without commentary or explanations
+            **Example of Correct Line Numbering:**
+            \`\`\`diff
+            1  // Context line - count as line 1
+            2  function test() { // Context line - count as line 2
+            3+ const x = 5; // Added line - count as line 3 and can be analyzed
+            4+ return x; // Added line - count as line 4 and can be analyzed
+            5  } // Context line - count as line 5
+            \`\`\`
+            **VERIFY your line numbers and code_snippet matches BEFORE returning the result.**
+            "
+            if [ "$IS_DELETED" = true ]; then
+              ENHANCED_PROMPT="${ENHANCED_PROMPT}
+              **Note: This file has been deleted. Please comment on whether this deletion may have any security or code quality implications.**
+              "
+            fi
+            echo "📌 Debug: Sending AI review request for $FILE..."
+            jq -n --arg system_content "You are a GitHub Copilot reviewer like the one shown in the screenshots. You analyze code and return precise, actionable feedback that can be placed as inline comments WITH EXACT LINE NUMBERS and CODE SNIPPETS. Focus on security and code quality issues. YOU MUST COUNT LINE NUMBERS CORRECTLY and VERIFY your code_snippet matches the line." \
+                  --arg user_content "$ENHANCED_PROMPT" \
+            '{
+              "model": "gpt-4o",
+              "messages": [
+                { "role": "system", "content": $system_content },
+                { "role": "user", "content": $user_content }
+              ],
+              "temperature": 0.1,
+              "max_tokens": 4000,
+              "reasoning_effort": "medium",
+              "response_format": { "type": "json_object" }
+            }' > request.json
+            echo "📌 Debug: Request JSON for $FILE:"
+            cat request.json
+            echo "📌 Debug: Calling OpenAI API..."
+            response=$(curl -sS -w "%{http_code}" -o response.json https://api.openai.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+                -d @request.json)
+            if [[ "$response" -ne 200 ]]; then
+              echo "❌ Error: OpenAI API call failed with status code $response. Response: $(cat response.json)"
+              continue
+            fi
+            if ! jq empty response.json 2>/dev/null; then
+                echo "❌ Error: OpenAI API response is not valid JSON."
+                continue
+            fi
+            echo "📌 Debug: Checking AI response..."
+            AI_RESPONSE=$(jq -r '.choices[0].message.content' response.json)
+            if [[ -z "$AI_RESPONSE" || "$AI_RESPONSE" == "null" ]]; then
+                echo "❌ Error: OpenAI returned an empty response for $FILE!"
+                continue
+            fi
+            RESPONSE_TYPE=$(echo "$AI_RESPONSE" | jq -r 'type')
+            if [[ "$RESPONSE_TYPE" == "object" ]]; then
+              if echo "$AI_RESPONSE" | jq -e '.suggestions' > /dev/null 2>&1; then
+                echo "📌 Debug: Response contains 'suggestions' array, extracting..."
+                VALID_OUTPUT=$(echo "$AI_RESPONSE" | jq '.suggestions')
+              else
+                echo "📌 Debug: Response is an object, converting to array..."
+                VALID_OUTPUT=$(echo "[$AI_RESPONSE]" | jq '.')
+              fi
+            elif [[ "$RESPONSE_TYPE" == "array" ]]; then
+              VALID_OUTPUT="$AI_RESPONSE"
+            else
+              echo "❌ Error: Unexpected response type: $RESPONSE_TYPE"
+              continue
+            fi
+            echo "📌 Debug: Standardizing response format..."
+            ORIGINAL_COUNT=$(echo "$VALID_OUTPUT" | jq 'length')
+            VALID_OUTPUT=$(echo "$VALID_OUTPUT" | jq --arg filename "$FILE" '
+              map(. + {
+                "filename": $filename,
+                "suggested_code": (.suggested_code // ""),
+                "code_snippet": (.code_snippet // "")
+              })
+              | map(select(.start_line != null and .comment != null))
+              | if length == 0 then [] else . end
+            ')
+            FILTERED_COUNT=$(echo "$VALID_OUTPUT" | jq 'length')
+            echo "📌 Debug: Filtered suggestions count: $FILTERED_COUNT (was $ORIGINAL_COUNT)"
+            VALID_OUTPUT=$(echo "$VALID_OUTPUT" | jq 'map(.suggested_code |= (if type=="string" then (gsub("\n+"; "\n") | ltrimstr("\n") | rtrimstr("\n")) else . end))')
+            if [ "$IS_DELETED" = true ]; then
+                VALID_OUTPUT=$(echo "$VALID_OUTPUT" | jq --arg file "$FILE" 'map(. + {is_deleted: true})')
+            fi
+            if [[ -z "$VALID_OUTPUT" || "$VALID_OUTPUT" == "null" || "$VALID_OUTPUT" == "[]" ]]; then
+                echo "📌 Info: No valid suggestions found for $FILE."
+                continue
+            fi
+            jq -s 'add' ai_review_output.json <(echo "$VALID_OUTPUT") > ai_review_temp.json && mv ai_review_temp.json ai_review_output.json
+          done <<< "$CHANGED_FILES"
+          echo "✅ AI review output saved in ai_review_output.json."
+
+      - name: Process AI Review Output
+        run: |
+          set -e
+          echo "📌 Debug: Checking if ai_review_output.json contains valid JSON..."
+          jq . ai_review_output.json > /dev/null || { echo "❌ Error: ai_review_output.json is not valid JSON!"; exit 1; }
+          JSON_TYPE=$(jq -r 'type' ai_review_output.json)
+          if [[ "$JSON_TYPE" == "object" ]]; then
+            echo "❌ Error: AI output is an object! Flattening..."
+            jq '[.suggestions[], .vulnerabilities[], .best_practices[]] | flatten' ai_review_output.json > ai_review_output_fixed.json
+            mv ai_review_output_fixed.json ai_review_output.json
+          fi
+          JSON_TYPE=$(jq -r 'type' ai_review_output.json)
+          if [[ "$JSON_TYPE" != "array" ]]; then
+            echo "❌ Error: AI output is still not an array! Exiting..."
+            exit 1
+          fi
+          echo "✅ AI review output successfully processed."
+
+      - name: Create Line Mapping Function
+        run: |
+          cat << 'EOF' > find_line_functions.sh
+          #!/bin/bash
+          find_actual_line_number() {
+            local file="$1"
+            local gpt_line="$2"
+            local code_snippet="$3"
+            local map_file=".diff_maps/${file//\//_}.line_map"
+            local hunks_file=".diff_maps/${file//\//_}.hunks"
+            echo "📌 Debug: Finding line for $file:$gpt_line with snippet: '$code_snippet'"
+            if [ -n "$code_snippet" ] && [ -f "$file" ]; then
+              local escaped_snippet=$(echo "$code_snippet" | sed 's/[]\/$*.^[]/\\&/g')
+              if [ -n "$escaped_snippet" ]; then
+                local content_lines=$(grep -n "$escaped_snippet" "$file" 2>/dev/null | cut -d: -f1)
+                if [ -n "$content_lines" ]; then
+                  local closest_line=$(echo "$content_lines" | awk -v target="$gpt_line" '
+                    function abs(x) { return x < 0 ? -x : x }
+                    BEGIN { min_diff = 1000; closest = 0 }
+                    {
+                      diff = abs($1 - target);
+                      if (diff < min_diff) {
+                        min_diff = diff;
+                        closest = $1;
+                      }
+                    }
+                    END { print closest }
+                  ')
+                  if [ -n "$closest_line" ] && [ "$closest_line" -gt 0 ]; then
+                    echo "📌 Debug: Found exact code snippet match at line $closest_line"
+                    echo "$closest_line"
+                    return 0
+                  fi
+                fi
+              fi
+            fi
+            if [ -f "$map_file" ]; then
+              local exact_match=$(grep "^$gpt_line:" "$map_file" | head -1)
+              if [ -n "$exact_match" ]; then
+                echo "📌 Debug: Found exact line map match"
+                echo "$gpt_line"
+                return 0
+              fi
+              for offset in {-5..5}; do
+                local approx_line=$((gpt_line + offset))
+                if [ "$approx_line" -gt 0 ] && grep -q "^$approx_line:" "$map_file"; then
+                  echo "📌 Debug: Found approximate line map match at $approx_line (offset $offset)"
+                  echo "$approx_line"
+                  return 0
+                fi
+              done
+            fi
+            if [ -f "$hunks_file" ]; then
+              local hunk_line=$(awk -v target="$gpt_line" '
+                BEGIN { min_diff = 1000; line = 0 }
+                /^hunk:/ {
+                  split($0, parts, ":");
+                  split(parts[2], hunk_parts, " ");
+                  gsub(/^@@ -/, "", hunk_parts[1]);
+                  gsub(/,.*$/, "", hunk_parts[1]);
+                  gsub(/^.*\+/, "", hunk_parts[2]);
+                  gsub(/,.*$/, "", hunk_parts[2]);
+                  start_line = int(hunk_parts[2]);
+                  diff = target - start_line;
+                  if (diff >= 0 && diff < min_diff) {
+                    min_diff = diff;
+                    line = start_line;
+                  }
+                }
+                END { print line }
+              ' "$hunks_file")
+              if [ -n "$hunk_line" ] && [ "$hunk_line" -gt 0 ]; then
+                local relative_offset=$((gpt_line - 1))
+                local actual_line=$((hunk_line + relative_offset))
+                echo "📌 Debug: Found hunk-based match at $actual_line"
+                echo "$actual_line"
+                return 0
+              fi
+            fi
+            if [ -f "pr_diff_positions.json" ]; then
+              local github_line=$(jq -r --arg file "$file" '.[] | select(.filename == $file) | 
+                .patch // "" | 
+                match("@@.*@@") | 
+                select(.) | 
+                .[0] | 
+                match("\\+([0-9]+)") | 
+                .captures[0].string' pr_diff_positions.json 2>/dev/null)
+              if [ -n "$github_line" ] && [ "$github_line" -gt 0 ]; then
+                local offset=$((gpt_line - 1))
+                local actual_line=$((github_line + offset))
+                echo "📌 Debug: Found GitHub API-based match at $actual_line"
+                echo "$actual_line"
+                return 0
+              fi
+            fi
+            echo "📌 Debug: Using original line number $gpt_line as fallback"
+            echo "$gpt_line"
+          }
+          is_line_in_diff() {
+            local file="$1"
+            local line="$2"
+            local diff_file=".diff_maps/${file//\//_}.added_lines"
+            echo "📌 Debug: Checking if line $line in $file is part of diff..."
+            if [ -f "$diff_file" ]; then
+              if grep -q "^$line:" "$diff_file"; then
+                echo "📌 Debug: Exact match found for line $line in diff file"
+                return 0
+              fi
+              for offset in {-3..3}; do
+                [ "$offset" -eq 0 ] && continue
+                local approx_line=$((line + offset))
+                if [ "$approx_line" -gt 0 ] && grep -q "^$approx_line:" "$diff_file"; then
+                  echo "📌 Debug: Approximate match found at line $approx_line (offset $offset)"
+                  return 0
+                fi
+              done
+              echo "📌 Debug: No match found in diff file, trying GitHub API data..."
+            else
+              echo "📌 Debug: Diff file not found: $diff_file"
+            fi
+            if [ -f "pr_diff_positions.json" ]; then
+              local jq_result
+              jq_result=$(jq -r --arg file "$file" --arg line "$line" '
+                [.[] | select(.filename == $file) | 
+                .patch // "" | 
+                contains("+") and (
+                  (
+                    match("@@.*\\+([0-9]+),([0-9]+).*@@") as $match |
+                    if $match then
+                      ($match.captures[0].string | tonumber) <= ($line | tonumber) and 
+                      ($line | tonumber) < (($match.captures[0].string | tonumber) + ($match.captures[1].string | tonumber))
+                    else false end
+                  ) or (
+                    match("@@.*\\+([0-9]+).*@@") as $match |
+                    if $match then
+                      ($match.captures[0].string | tonumber) <= ($line | tonumber)
+                    else false end
+                  )
+                )] | any
+              ' pr_diff_positions.json 2>/dev/null)
+              if [ "$jq_result" = "true" ]; then
+                echo "📌 Debug: Line found in GitHub API diff data"
+                return 0
+              fi
+              echo "📌 Debug: Line not found in GitHub API diff data"
+            else
+              echo "📌 Debug: GitHub API diff data file not found"
+            fi
+            echo "📌 Debug: Line $line in $file is NOT part of the diff"
+            return 1
+          }
+          EOF
+          chmod +x find_line_functions.sh
+
+      - name: Post Inline Comments to PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          COMMIT_ID=$(git rev-parse HEAD)
+          source ./find_line_functions.sh
+          echo "DEBUG: Checking if ai_review_output.json contains valid JSON..."
+          jq . ai_review_output.json > /dev/null || { echo "ERROR: ai_review_output.json is not valid JSON!"; exit 1; }
+          JSON_TYPE=$(jq -r 'type' ai_review_output.json)
+          if [[ "$JSON_TYPE" != "array" ]]; then
+            echo "ERROR: AI output is not an array! Converting to array..."
+            jq '[.]' ai_review_output.json > ai_review_output_fixed.json
+            mv ai_review_output_fixed.json ai_review_output.json
+          fi
+          TOTAL_COMMENTS=$(jq 'length' ai_review_output.json)
+          POSTED_INLINE=0
+          POSTED_FALLBACK=0
+          SKIPPED=0
+          echo "DEBUG: Processing AI review comments..."
+          jq -c '.[]' ai_review_output.json | while IFS= read -r line; do
+            FILENAME=$(echo "$line" | jq -r '.filename // empty')
+            IS_DELETED=$(echo "$line" | jq -r '.is_deleted // false')
+            GPT_START_LINE=$(echo "$line" | jq -r '.start_line // empty')
+            GPT_END_LINE=$(echo "$line" | jq -r '.end_line // empty')
+            CODE_SNIPPET=$(echo "$line" | jq -r '.code_snippet // empty')
+            COMMENT=$(echo "$line" | jq -r '.comment // empty')
+            SUGGESTED_CODE=$(echo "$line" | jq -r '.suggested_code // empty')
+            if [[ -z "$FILENAME" || -z "$GPT_START_LINE" || -z "$COMMENT" ]]; then
+              echo "ERROR: Invalid AI output - missing required fields."
+              echo "DEBUG: FILENAME: $FILENAME, START_LINE: $GPT_START_LINE, COMMENT: $COMMENT"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+            if [[ "$IS_DELETED" = "true" || ! -f "$FILENAME" ]]; then
+              echo "DEBUG: Posting regular comment for deleted file $FILENAME"
+              gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+                -f body="**Deleted File: ${FILENAME}**
+                
+${COMMENT}" || true
+              POSTED_FALLBACK=$((POSTED_FALLBACK + 1))
+              continue
+            fi
+            echo "DEBUG: Finding actual line for $FILENAME:$GPT_START_LINE with snippet: '$CODE_SNIPPET'"
+            ACTUAL_START_LINE=$(find_actual_line_number "$FILENAME" "$GPT_START_LINE" "$CODE_SNIPPET")
+            if [[ -n "$GPT_END_LINE" && "$GPT_END_LINE" != "$GPT_START_LINE" ]]; then
+              ACTUAL_END_LINE=$(find_actual_line_number "$FILENAME" "$GPT_END_LINE" "")
+              if [[ "$ACTUAL_END_LINE" -le "$ACTUAL_START_LINE" ]]; then
+                ACTUAL_END_LINE=$((ACTUAL_START_LINE + (GPT_END_LINE - GPT_START_LINE)))
+              fi
+            else
+              ACTUAL_END_LINE=$ACTUAL_START_LINE
+            fi
+            echo "DEBUG: Mapped GPT line $GPT_START_LINE:$GPT_END_LINE to actual lines $ACTUAL_START_LINE:$ACTUAL_END_LINE"
+            if [[ $ACTUAL_START_LINE -le 0 ]]; then
+              ACTUAL_START_LINE=1
+              echo "DEBUG: Adjusted start line to 1 (was <= 0)"
+            fi
+            if [[ $ACTUAL_END_LINE -le 0 ]]; then
+              ACTUAL_END_LINE=$ACTUAL_START_LINE
+              echo "DEBUG: Adjusted end line to match start line (was <= 0)"
+            fi
+            if ! is_line_in_diff "$FILENAME" "$ACTUAL_START_LINE"; then
+              echo "DEBUG: Line $ACTUAL_START_LINE in $FILENAME is not part of the diff. Posting as regular comment."
+              gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+                -f body="**${FILENAME}** (line $ACTUAL_START_LINE):
+                
+${COMMENT}
+
+${SUGGESTED_CODE:+💡 **Suggested Fix:**
+\`\`\`suggestion
+$SUGGESTED_CODE
+\`\`\`}" || true
+              POSTED_FALLBACK=$((POSTED_FALLBACK + 1))
+              continue
+            fi
+            CLEANED_SUGGESTED_CODE=$(echo "$SUGGESTED_CODE" \
+              | sed -E 's/^```[a-zA-Z0-9]+[[:space:]]*//; s/```[[:space:]]*$//' \
+              | tr -s '\n')
+            if [[ -n "$CLEANED_SUGGESTED_CODE" && "$CLEANED_SUGGESTED_CODE" != "null" && "$CLEANED_SUGGESTED_CODE" != "N/A" ]]; then
+              FORMATTED_COMMENT="$COMMENT\n\n💡 **Suggested Fix:**\n\`\`\`suggestion\n$CLEANED_SUGGESTED_CODE\n\`\`\`"
+            else
+              FORMATTED_COMMENT="$COMMENT"
+            fi
+            echo -e "$FORMATTED_COMMENT" > comment_body.txt
+            if [[ "$ACTUAL_END_LINE" -gt "$ACTUAL_START_LINE" ]]; then
+              echo "DEBUG: Posting multi-line comment for lines $ACTUAL_START_LINE-$ACTUAL_END_LINE"
+              if gh api repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments \
+                -f body="@comment_body.txt" \
+                -f commit_id="$COMMIT_ID" \
+                -f path="$FILENAME" \
+                -F start_line="$ACTUAL_START_LINE" \
+                -F start_side="RIGHT" \
+                -F line="$ACTUAL_END_LINE" \
+                -f side="RIGHT" > comment_result.json 2>&1; then
+                echo "✅ Successfully posted multi-line comment"
+                POSTED_INLINE=$((POSTED_INLINE + 1))
+              else
+                echo "⚠️ Failed to post multi-line comment, using fallback"
+                  gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+                  -f body="**${FILENAME}** (lines $ACTUAL_START_LINE-$ACTUAL_END_LINE):
+                  
+$(cat comment_body.txt)" || true
+                POSTED_FALLBACK=$((POSTED_FALLBACK + 1))
+              fi
+            else
+              echo "DEBUG: Posting single-line comment for line $ACTUAL_START_LINE"
+              if gh api repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments \
+                -f body="@comment_body.txt" \
+                -f commit_id="$COMMIT_ID" \
+                -f path="$FILENAME" \
+                -F line="$ACTUAL_START_LINE" \
+                -f side="RIGHT" > comment_result.json 2>&1; then
+                echo "✅ Successfully posted single-line comment"
+                POSTED_INLINE=$((POSTED_INLINE + 1))
+              else
+                echo "⚠️ Failed to post single-line comment, using fallback"
+                  gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+                  -f body="**${FILENAME}** (line $ACTUAL_START_LINE):
+                  
+$(cat comment_body.txt)" || true
+                POSTED_FALLBACK=$((POSTED_FALLBACK + 1))
+              fi
+            fi
+          done
+          echo "✅ Comment posting complete:"
+          echo "   - Total comments processed: $TOTAL_COMMENTS"
+          echo "   - Successfully posted inline: $POSTED_INLINE"
+          echo "   - Posted as regular comments: $POSTED_FALLBACK" 
+          echo "   - Skipped: $SKIPPED"
+
+  enterprise-standard-check:
+    runs-on: ubuntu-latest
+    needs: [quality-security-analysis]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Gather Full Code From Changed Files
+        run: |
+          CHANGED_FILES=$(git diff --name-only origin/develop...HEAD)
+          echo '{"original_files": [' > original_files_temp.json
+          for file in $CHANGED_FILES; do
+            if [[ $file == *.json ]] || [[ $file == *.png ]]; then
+              continue
+            fi
+            if [ -f "$file" ]; then
+              CONTENT=$(jq -Rs . < "$file")
+              echo "{\"filename\": \"$file\", \"content\": $CONTENT}," >> original_files_temp.json
+            fi
+          done
+          sed -i '$ s/,$//' original_files_temp.json
+          echo "]}" >> original_files_temp.json
+
+      - name: Extract Detailed Code Diff
+        run: |
+          DIFF_CONTENT=$(git diff --unified=5 origin/develop...HEAD)
+          echo "$DIFF_CONTENT" > detailed_diff.txt
+
+      - name: Analyze Code Against Best Practices
+        id: validate
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BEST_PRACTICES: ${{ vars.BEST_PRACTICES }}
+          PR_REVIEW_PROMPT: ${{ vars.PR_REVIEW_PROMPT }}
+        run: |
+          set -e
+          ORIGINAL_FILES=$(cat original_files_temp.json)
+          DIFF_CONTENT=$(cat detailed_diff.txt)
+          LANGUAGE_STATS=$(git diff --name-only origin/develop...HEAD | grep -v '^[[:space:]]*$' | 
+            awk -F. '{if (NF > 1) {print $NF}}' | 
+            sort | uniq -c | 
+            awk '{print $2": "$1" files"}')
+          FILE_CATEGORIES=$(git diff --name-only origin/develop...HEAD | grep -v '^[[:space:]]*$' | 
+            awk -F/ '{if (NF > 1) {print $1}}' | 
+            sort | uniq -c | 
+            awk '{print $2" directory: "$1" files"}')
+          ENHANCED_PROMPT="${PR_REVIEW_PROMPT}
+
+          **Pull Request Analysis Request**
+          This is a comprehensive review of code changes for assessment against enterprise standards.
+
+          **Files Changed Overview:**
+          ${LANGUAGE_STATS}
+
+          **Directories Modified:**
+          ${FILE_CATEGORIES}
+
+          **Detailed Code Changes:**
+          \`\`\`diff
+          ${DIFF_CONTENT}
+          \`\`\`
+
+          **Review Instructions:**
+          1. Thoroughly analyze the code changes shown in the diff.
+          2. Use ${BEST_PRACTICES} as your enterprise standards reference.
+          3. For each best practice category, provide:
+             - Specific examples from the code that demonstrate adherence or violation
+             - Concrete improvement suggestions where applicable
+             - A fair rating: 'extraordinary', 'acceptable', or 'poor'
+          4. Return a detailed markdown table titled 'Enterprise Standards' with rows for each category and columns for 'Category', 'Rating', and 'Findings'.
+          5. Include 2-3 key recommendations as bullet points after the table.
+
+          Focus on substantive analysis rather than superficial issues."
+          
+          jq -n --arg system_content "You are an Enterprise Code Quality Reviewer responsible for evaluating code against established best practices and enterprise standards. You provide comprehensive, fair, and actionable assessments." \
+                --arg user_content "$ENHANCED_PROMPT" \
+          '{
+            "model": "gpt-4o",
+            "messages": [
+              {
+                "role": "system",
+                "content": $system_content
+              },
+              {
+                "role": "user",
+                "content": $user_content
+              }
+            ],
+            "temperature": 0.2,
+            "reasoning_effort": "medium"
+          }' > request.json
+          curl -sS https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d @request.json > response.json
+          ASSISTANT_MSG=$(jq -r '.choices[0].message.content' response.json)
+          {
+            echo "review<<EOF"
+            echo "$ASSISTANT_MSG"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+      
+      - name: Post Table Comment
+        env:
+          COMMENT: ${{ steps.validate.outputs.review }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$COMMENT" ] || [ "$COMMENT" = "null" ]; then
+            echo "No comment to post."
+            exit 0
+          fi
+          gh api \
+            repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body="$COMMENT"
